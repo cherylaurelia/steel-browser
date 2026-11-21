@@ -1,5 +1,26 @@
 import { Page, HTTPResponse } from "puppeteer-core";
 
+function isMainFrameDocument(page: Page, res: HTTPResponse): boolean {
+  const req = res.request();
+  return req.resourceType() === "document" && req.frame() === page.mainFrame();
+}
+
+/**
+ * Remembers the last main-frame document response, so a scrape can report the status of the
+ * document it extracts, also when the page navigated again after `goto` (e.g. during `delay`).
+ */
+export function watchDocumentResponses(page: Page) {
+  let latest: HTTPResponse | null = null;
+  const onResponse = (res: HTTPResponse) => {
+    if (isMainFrameDocument(page, res)) latest = res;
+  };
+  page.on("response", onResponse);
+  return {
+    latest: () => latest,
+    stop: () => page.off("response", onResponse),
+  };
+}
+
 /**
  * Navigates to a URL and ignores net::ERR_ABORTED if the main-frame response is a PDF.
  * Returns { response, isPdf, pdfResponse }.
@@ -16,11 +37,7 @@ export async function safeGoto(
   let pdfResponse: HTTPResponse | null = null;
 
   const onResponse = (res: HTTPResponse) => {
-    // Only consider main-frame document navigations
-    const req = res.request();
-    const isMainFrameDoc = req.resourceType() === "document" && req.frame() === page.mainFrame();
-
-    if (!isMainFrameDoc) return;
+    if (!isMainFrameDocument(page, res)) return;
 
     const ct = (res.headers()["content-type"] || "").toLowerCase();
     console.log("content-type", ct);

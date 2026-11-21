@@ -1,5 +1,8 @@
 import type { FastifyReply } from "fastify";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import puppeteer, { type Browser, type Page } from "puppeteer-core";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { CDPService } from "../../services/cdp/cdp.service.js";
 import type { SessionService } from "../../services/session.service.js";
 import {
@@ -255,5 +258,94 @@ describe("quick action failures", () => {
 
     expect(status).toHaveBeenCalledWith(500);
     expect(refresh).toHaveBeenCalledOnce();
+  });
+});
+
+const chrome = process.env.CHROME_EXECUTABLE_PATH;
+
+describe.skipIf(!chrome)("scrape status code", () => {
+  let browser: Browser;
+  let page: Page;
+  let server: Server;
+  let origin: string;
+
+  beforeAll(async () => {
+    server = createServer((req, res) => {
+      const html = (title: string, script = "") =>
+        `<html><head><title>${title}</title></head><body><p>${title}</p>${script}</body></html>`;
+      switch (req.url) {
+        case "/ok":
+          res.writeHead(200, { "content-type": "text/html" }).end(html("Found"));
+          break;
+        case "/moved":
+          res.writeHead(301, { location: "/ok" }).end();
+          break;
+        case "/blocked":
+          res.writeHead(403, { "content-type": "text/html" }).end(html("Just a moment"));
+          break;
+        case "/challenge":
+          res
+            .writeHead(403, { "content-type": "text/html" })
+            .end(
+              html(
+                "Just a moment",
+                "<script>setTimeout(() => location.replace('/ok'), 300)</script>",
+              ),
+            );
+          break;
+        case "/broken":
+          res.writeHead(500).end();
+          break;
+        default:
+          res.writeHead(404, { "content-type": "text/html" }).end(html("Not found"));
+      }
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    browser = await puppeteer.launch({
+      executablePath: chrome,
+      headless: true,
+      args: ["--no-sandbox"],
+    });
+    page = await browser.newPage();
+  });
+
+  afterAll(async () => {
+    await browser?.close();
+    await new Promise((resolve) => server?.close(resolve));
+  });
+
+  async function scrape(path: string, delay?: number) {
+    const browserService = {
+      isRunning: () => true,
+      getPrimaryPage: async () => page,
+      waitForPageSetup: async () => undefined,
+    } as unknown as CDPService;
+    const reply = { code: vi.fn(), send: vi.fn() };
+    reply.code.mockReturnValue(reply);
+    const request = { body: { url: `${origin}${path}`, format: ["html"], delay } };
+    await handleScrape({} as SessionService, browserService, request as never, reply as never);
+    expect(reply.code).not.toHaveBeenCalled();
+    return reply.send.mock.calls[0][0].metadata;
+  }
+
+  it.each([
+    ["/ok", 200],
+    ["/moved", 200],
+    ["/missing", 404],
+    ["/blocked", 403],
+    ["/broken", 500],
+  ])("reports the status of %s", async (path, statusCode) => {
+    expect(await scrape(path)).toMatchObject({ statusCode });
+  });
+
+  it("reports the page that loaded during the delay, not the one before it", async () => {
+    expect(await scrape("/challenge", 1_000)).toMatchObject({ statusCode: 200, title: "Found" });
+  });
+
+  it("stops listening to the primary page once the scrape is done", async () => {
+    const listeners = page.listenerCount("response");
+    await scrape("/ok");
+    expect(page.listenerCount("response")).toBe(listeners);
   });
 });

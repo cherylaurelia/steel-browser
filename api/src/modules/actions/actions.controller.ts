@@ -19,7 +19,7 @@ import { DefuddleResponse } from "defuddle";
 import { buildHtmlLikeMetadataFromPdf, convertPdfWithMupdf } from "../../utils/scrape/pdfToHtml.js";
 import { renderPdfFirstPageAsJpeg } from "../../utils/scrape/pdfToImage.js";
 import { fetchPdf } from "../../utils/scrape/fetchPdf.js";
-import { safeGoto } from "../../utils/scrape/safeGoTo.js";
+import { safeGoto, watchDocumentResponses } from "../../utils/scrape/safeGoTo.js";
 
 export const PRIMARY_PAGE_RESET_TIMEOUT_MS = 5_000;
 export const PAGE_SETUP_TIMEOUT_MS = 3_000;
@@ -85,6 +85,7 @@ export const handleScrape = async (
 
   let proxy: IProxyServer | null = null;
   let context: BrowserContext | null = null;
+  let documents: ReturnType<typeof watchDocumentResponses> | null = null;
 
   try {
     if (proxyUrl) {
@@ -121,6 +122,7 @@ export const handleScrape = async (
       }
     }
 
+    documents = watchDocumentResponses(page);
     const navigationStart = Date.now();
     const safeResponse = normalizedUrl
       ? await safeGoto(page, normalizedUrl, {
@@ -273,7 +275,6 @@ export const handleScrape = async (
               favicon: document.querySelector('link[rel="icon"]')?.getAttribute("href"),
 
               jsonLd: extractJsonLd(),
-              statusCode: 200,
             },
           };
         }),
@@ -284,7 +285,14 @@ export const handleScrape = async (
       htmlContent = html;
       times.extractionTime = Date.now() - startTime - (times.pageLoadTime || 0);
 
-      scrapeResponse = { content: {}, metadata, links };
+      // No document response when the scrape did not navigate (/v1/sessions/scrape without url).
+      // A navigation still in flight here would pair its status with the current HTML.
+      const documentResponse = documents.latest() ?? response;
+      scrapeResponse = {
+        content: {},
+        metadata: { ...metadata, statusCode: documentResponse?.status() ?? 200 },
+        links,
+      };
 
       if (base64Screenshot) {
         scrapeResponse.screenshot = base64Screenshot;
@@ -366,6 +374,7 @@ export const handleScrape = async (
     }
     return reply.code(500).send({ message: error });
   } finally {
+    documents?.stop();
     await closeEphemeralContext(context);
     if (proxy) {
       await proxy.close(true).catch(() => {});
